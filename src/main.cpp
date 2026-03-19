@@ -17,7 +17,7 @@
 // ==========================================
 
 // --- 任务周期 ---
-#define SERVO_SENSOR_INTERVAL 50  // [毫秒] 舵机+传感器刷新
+#define SERVO_SENSOR_INTERVAL 50   // [毫秒] 舵机+传感器刷新
 #define SERIAL_REPORT_INTERVAL 200 // [毫秒] 串口上报
 #define LED_UPDATE_INTERVAL 100    // [毫秒] 灯光刷新频率
 #define MOTOR_UPDATE_INTERVAL 50   // [毫秒] 电机控制刷新
@@ -128,7 +128,8 @@ void servoSensorCallback();
 void serialReportCallback();
 void ledControlCallback();
 void motorControlCallback();
-void setMotorOutput(uint8_t enPin, uint8_t inPin1, uint8_t inPin2, bool forward, uint8_t speed, bool invert);
+void setMotorStandby(bool enabled);
+void setMotorOutput(uint8_t pwmPin, uint8_t dirPin, bool forward, uint8_t speed, bool invert);
 bool calibrateGyroBias();
 void setServoTarget(int angle);
 bool isServoSettled(unsigned long nowMs);
@@ -183,14 +184,14 @@ void setup()
 
     pinMode(PIN_MOTOR_L_EN, OUTPUT);
     pinMode(PIN_MOTOR_L_IN1, OUTPUT);
-    pinMode(PIN_MOTOR_L_IN2, OUTPUT);
     pinMode(PIN_MOTOR_R_EN, OUTPUT);
     pinMode(PIN_MOTOR_R_IN3, OUTPUT);
-    pinMode(PIN_MOTOR_R_IN4, OUTPUT);
+#ifdef PIN_MOTOR_STBY
+    pinMode(PIN_MOTOR_STBY, OUTPUT);
+    digitalWrite(PIN_MOTOR_STBY, LOW);
+#endif
     digitalWrite(PIN_MOTOR_L_IN1, LOW);
-    digitalWrite(PIN_MOTOR_L_IN2, LOW);
     digitalWrite(PIN_MOTOR_R_IN3, LOW);
-    digitalWrite(PIN_MOTOR_R_IN4, LOW);
     analogWrite(PIN_MOTOR_L_EN, 0);
     analogWrite(PIN_MOTOR_R_EN, 0);
 
@@ -285,20 +286,27 @@ void captureHeadingTarget()
     state.headingTargetDeg = state.yawDeg;
 }
 
-void setMotorOutput(uint8_t enPin, uint8_t inPin1, uint8_t inPin2, bool forward, uint8_t speed, bool invert)
+void setMotorStandby(bool enabled)
+{
+#ifdef PIN_MOTOR_STBY
+    digitalWrite(PIN_MOTOR_STBY, enabled ? HIGH : LOW);
+#else
+    (void)enabled;
+#endif
+}
+
+void setMotorOutput(uint8_t pwmPin, uint8_t dirPin, bool forward, uint8_t speed, bool invert)
 {
     bool dir = invert ? !forward : forward;
     if (speed == 0)
     {
-        digitalWrite(inPin1, LOW);
-        digitalWrite(inPin2, LOW);
-        analogWrite(enPin, 0);
+        digitalWrite(dirPin, LOW);
+        analogWrite(pwmPin, 0);
         return;
     }
 
-    digitalWrite(inPin1, dir ? HIGH : LOW);
-    digitalWrite(inPin2, dir ? LOW : HIGH);
-    analogWrite(enPin, speed);
+    digitalWrite(dirPin, dir ? HIGH : LOW);
+    analogWrite(pwmPin, speed);
 }
 
 void applyMotion(MotionCommand motion, uint8_t baseSpeed, bool useHeadingCorrection)
@@ -359,8 +367,11 @@ void applyMotion(MotionCommand motion, uint8_t baseSpeed, bool useHeadingCorrect
     state.motorLeftSpeed = leftSpeed;
     state.motorRightSpeed = rightSpeed;
 
-    setMotorOutput(PIN_MOTOR_L_EN, PIN_MOTOR_L_IN1, PIN_MOTOR_L_IN2, leftForward, leftSpeed, MOTOR_LEFT_INVERT);
-    setMotorOutput(PIN_MOTOR_R_EN, PIN_MOTOR_R_IN3, PIN_MOTOR_R_IN4, rightForward, rightSpeed, MOTOR_RIGHT_INVERT);
+    bool enableDriver = motion != MOTION_STOP && (leftSpeed > 0 || rightSpeed > 0);
+    setMotorStandby(enableDriver);
+
+    setMotorOutput(PIN_MOTOR_L_EN, PIN_MOTOR_L_IN1, leftForward, leftSpeed, MOTOR_LEFT_INVERT);
+    setMotorOutput(PIN_MOTOR_R_EN, PIN_MOTOR_R_IN3, rightForward, rightSpeed, MOTOR_RIGHT_INVERT);
 }
 
 // ==========================================
