@@ -1,593 +1,348 @@
 #include <Arduino.h>
-#include <Wire.h>
 #include <Servo.h>
-#include <math.h>
-#include <NewPing.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
-#include <TaskScheduler.h>
-#include <ArduinoLog.h>
-#include <Adafruit_NeoPixel.h>
-
-// 引入引脚定义
 #include "PinConfig.h"
 
-// ==========================================
-// ⚙️ 参数配置区域
-// ==========================================
-
-// --- 任务周期 ---
-#define SERVO_SENSOR_INTERVAL 50   // [毫秒] 舵机+传感器刷新
-#define SERIAL_REPORT_INTERVAL 200 // [毫秒] 串口上报
-#define LED_UPDATE_INTERVAL 100    // [毫秒] 灯光刷新频率
-#define MOTOR_UPDATE_INTERVAL 50   // [毫秒] 电机控制刷新
-
-// --- 距离阈值 ---
-#define DIST_SAFE_THRESHOLD 75.0     // [cm] 安全距离 (绿)
-#define DIST_DANGER_THRESHOLD 7.5    // [cm] 危险距离 (红)
-#define OBSTACLE_SCAN_THRESHOLD 20.0 // [cm] 进入避障扫描阈值
-
-// --- 电机参数 ---
-#define MOTOR_SPEED_MIN 80
-#define MOTOR_SPEED_MAX 200
-#define MOTOR_TURN_SPEED 160
-
-// --- 舵机扫描位 ---
-#define SERVO_CENTER_ANGLE 90
-#define SERVO_SCAN_RIGHT_ANGLE 30
-#define SERVO_SCAN_LEFT_ANGLE 150
-#define SERVO_SETTLE_MS 250
-
-// --- 避障动作时长 ---
-#define AVOID_REVERSE_DURATION_MS 300
-#define AVOID_TURN_DURATION_MS 350
-#define AVOID_TURN_AFTER_REVERSE_MS 450
-
-// --- MPU6050 偏航修正 ---
-#define GYRO_CALIBRATION_SAMPLES 100
-#define GYRO_CALIBRATION_DELAY_MS 5
-#define GYRO_Z_DEADBAND_DPS 0.5f
-#define HEADING_CORRECTION_KP 2.0f
-#define HEADING_CORRECTION_MAX 40
-
-enum MotionCommand
+// =========================================================
+// 状态与全局对象
+// =========================================================
+enum State
 {
-    MOTION_STOP,
-    MOTION_FORWARD,
-    MOTION_BACKWARD,
-    MOTION_TURN_LEFT,
-    MOTION_TURN_RIGHT,
+    STATE_NORMAL,
+    STATE_OBSTACLE
 };
 
-enum AvoidancePhase
-{
-    AVOID_DRIVE_FORWARD,
-    AVOID_SCAN_RIGHT,
-    AVOID_SCAN_CENTER,
-    AVOID_SCAN_LEFT,
-    AVOID_DECIDE,
-    AVOID_REVERSE,
-    AVOID_TURN_LEFT,
-    AVOID_TURN_RIGHT,
-};
-
-// ==========================================
-// 全局对象与变量
-// ==========================================
-
-Scheduler runner;
-
+State currentState = STATE_NORMAL;
 Servo myServo;
-NewPing sonar(PIN_SONAR_TRIG, PIN_SONAR_ECHO, 200);
-Adafruit_MPU6050 mpu;
-Adafruit_NeoPixel strip(WS2812_NUM_LEDS, PIN_WS2812, NEO_GRB + NEO_KHZ800);
 
-struct RobotState
-{
-    // 舵机
-    int servoAngle = SERVO_CENTER_ANGLE;
-    int servoTargetAngle = SERVO_CENTER_ANGLE;
-    unsigned long lastServoCommandMs = 0;
+// =========================================================
+// 参数配置
+// =========================================================
 
-    // 超声波
-    float distanceCm = 0.0;      // 当前舵机朝向下的测距
-    float frontDistanceCm = 200; // 车头正前方最近一次测距
-    unsigned long pingTimeUs = 0;
-    float scanRightDistanceCm = 0.0;
-    float scanCenterDistanceCm = 0.0;
-    float scanLeftDistanceCm = 0.0;
+// 运动参数
+const int BASE_SPEED = 120; // 基础速度 (0-255)
+const int MAX_SPEED = 200;  // 限制最大速度
+const int MIN_SPEED = 40;   // 限制最小速度
 
-    // MPU6050
-    float accelX = 0, accelY = 0, accelZ = 0;
-    float gyroX = 0, gyroY = 0, gyroZ = 0; // [deg/s]
-    float temp = 20.0;
-    float yawDeg = 0.0;
-    float headingTargetDeg = 0.0;
-    float gyroBiasZ = 0.0; // [rad/s]
-    unsigned long lastImuUpdateUs = 0;
-    bool mpuReady = false;
-    int headingCorrection = 0;
+// 舵机参数
+const int SERVO_CENTER = 80;
+const int SERVO_SCAN_AMP = 50;  // 正常扫描幅度：50度到110度
+const int SERVO_SCAN_SPEED = 5; // 扫描角度步长 (增加步长加快扫描)
+const int SERVO_SCAN_DELAY = 5; // 扫描延时（毫秒），越小扫描越快
 
-    // 电机输出
-    uint8_t motorLeftSpeed = 0;
-    uint8_t motorRightSpeed = 0;
-    bool motorLeftForward = true;
-    bool motorRightForward = true;
-    MotionCommand motionCommand = MOTION_STOP;
+// 超声波及避障参数
+const float OBSTACLE_DIST_THRES = 20.0; // 触发避障的最短距离（厘米）
+const float MAX_TRACK_WIDTH = 50.0;     // 用于PID的赛道最大宽度限制（厘米）
 
-    // 避障状态机
-    AvoidancePhase avoidancePhase = AVOID_DRIVE_FORWARD;
-    unsigned long phaseStartedMs = 0;
-    unsigned long phaseDurationMs = 0;
-} state;
+// PID 控制参数
+float Kp = 2;
+float Ki = 0.15;
+float Kd = 0.45;
 
-// ==========================================
+float error = 0.0;
+float last_error = 0.0;
+float integral = 0.0;
+
+// 距离与扫描变量
+float dist_left = MAX_TRACK_WIDTH;
+float dist_right = MAX_TRACK_WIDTH;
+float dist_center = MAX_TRACK_WIDTH;
+
+int currentServoAngle = SERVO_CENTER;
+int servoDirection = 1; // 1: 角度增加, -1: 角度减少
+unsigned long lastServoMoveTime = 0;
+
+// =========================================================
 // 函数声明
-// ==========================================
-void servoSensorCallback();
-void serialReportCallback();
-void ledControlCallback();
-void motorControlCallback();
-void setMotorStandby(bool enabled);
-void setMotorOutput(uint8_t pwmPin, uint8_t dirPin, bool forward, uint8_t speed, bool invert);
-bool calibrateGyroBias();
-void setServoTarget(int angle);
-bool isServoSettled(unsigned long nowMs);
-float normalizeDistanceCm(float distanceCm);
-uint8_t computeCruiseSpeed(float frontDistanceCm);
-void setAvoidancePhase(AvoidancePhase phase, unsigned long nowMs, unsigned long durationMs = 0);
-void captureHeadingTarget();
-void applyMotion(MotionCommand motion, uint8_t baseSpeed, bool useHeadingCorrection);
+// =========================================================
+void setupPins();
+float readSonar();
+void setMotorSpeed(int speedL, int speedR);
+void handleNormalState();
+void handleObstacleState();
+void updateServoScan();
 
-// ==========================================
-// 任务定义
-// ==========================================
-
-Task tServoSensor(SERVO_SENSOR_INTERVAL, TASK_FOREVER, &servoSensorCallback);
-Task tReport(SERIAL_REPORT_INTERVAL, TASK_FOREVER, &serialReportCallback);
-Task tLed(LED_UPDATE_INTERVAL, TASK_FOREVER, &ledControlCallback);
-Task tMotor(MOTOR_UPDATE_INTERVAL, TASK_FOREVER, &motorControlCallback);
-
-// ==========================================
-// Setup & Loop
-// ==========================================
-
+// =========================================================
+// 初始化
+// =========================================================
 void setup()
 {
-    Serial.begin(9600);
-    Log.begin(LOG_LEVEL_VERBOSE, &Serial);
-    Log.notice(F("--- WALL-E Robot System Starting ---" CR));
+    Serial.begin(115200);
+    setupPins();
 
     myServo.attach(PIN_SERVO_1);
-    myServo.write(state.servoAngle);
-    state.lastServoCommandMs = millis();
+    myServo.write(SERVO_CENTER);
+    delay(500); // 等待舵机归位
+}
 
-    strip.begin();
-    strip.setBrightness(50);
-    strip.show();
-    Log.notice(F("WS2812 LED initialized on pin %d" CR), PIN_WS2812);
+void setupPins()
+{
+    // 超声波
+    pinMode(PIN_SONAR_TRIG, OUTPUT);
+    pinMode(PIN_SONAR_ECHO, INPUT);
 
-    if (!mpu.begin())
-    {
-        state.mpuReady = false;
-        Log.error(F("Failed to find MPU6050 chip! Heading correction disabled." CR));
-    }
-    else
-    {
-        state.mpuReady = true;
-        Log.notice(F("MPU6050 Found!" CR));
-        mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-        mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-        mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-        calibrateGyroBias();
-    }
-
+    // 左电机
     pinMode(PIN_MOTOR_L_EN, OUTPUT);
     pinMode(PIN_MOTOR_L_IN1, OUTPUT);
+    pinMode(PIN_MOTOR_L_IN2, OUTPUT);
+
+    // 右电机
     pinMode(PIN_MOTOR_R_EN, OUTPUT);
     pinMode(PIN_MOTOR_R_IN3, OUTPUT);
-#ifdef PIN_MOTOR_STBY
+    pinMode(PIN_MOTOR_R_IN4, OUTPUT);
+
+    // 待机引脚
     pinMode(PIN_MOTOR_STBY, OUTPUT);
-    digitalWrite(PIN_MOTOR_STBY, LOW);
-#endif
-    digitalWrite(PIN_MOTOR_L_IN1, LOW);
-    digitalWrite(PIN_MOTOR_R_IN3, LOW);
-    analogWrite(PIN_MOTOR_L_EN, 0);
-    analogWrite(PIN_MOTOR_R_EN, 0);
-
-    runner.init();
-    runner.addTask(tServoSensor);
-    runner.addTask(tReport);
-    runner.addTask(tLed);
-    runner.addTask(tMotor);
-
-    tServoSensor.enable();
-    tReport.enable();
-    tLed.enable();
-    tMotor.enable();
-
-    Log.notice(F("System Ready." CR));
+    digitalWrite(PIN_MOTOR_STBY, HIGH); // 启用TB6612
 }
 
+// =========================================================
+// 主循环
+// =========================================================
 void loop()
 {
-    runner.execute();
-}
-
-// ==========================================
-// 辅助函数
-// ==========================================
-
-bool calibrateGyroBias()
-{
-    if (!state.mpuReady)
+    if (currentState == STATE_NORMAL)
     {
-        return false;
+        handleNormalState();
     }
-
-    float sumZ = 0.0f;
-    sensors_event_t a, g, temp;
-    for (int i = 0; i < GYRO_CALIBRATION_SAMPLES; ++i)
+    else if (currentState == STATE_OBSTACLE)
     {
-        mpu.getEvent(&a, &g, &temp);
-        sumZ += g.gyro.z;
-        delay(GYRO_CALIBRATION_DELAY_MS);
+        handleObstacleState();
     }
-
-    state.gyroBiasZ = sumZ / GYRO_CALIBRATION_SAMPLES;
-    state.lastImuUpdateUs = micros();
-    state.yawDeg = 0.0f;
-    state.headingTargetDeg = 0.0f;
-
-    Log.notice(F("MPU6050 gyro bias calibrated: %d mdps" CR), (int)(state.gyroBiasZ * 57295.0f));
-    return true;
 }
 
-void setServoTarget(int angle)
+// =========================================================
+// 传感器与执行器基础函数
+// =========================================================
+
+// 读取超声波距离（单位：厘米）
+float readSonar()
 {
-    state.servoTargetAngle = constrain(angle, 0, 180);
+    digitalWrite(PIN_SONAR_TRIG, LOW);
+    delayMicroseconds(2);
+    digitalWrite(PIN_SONAR_TRIG, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(PIN_SONAR_TRIG, LOW);
+
+    // timeout设置为30000微秒（约5米左右的往返时间），防止程序卡死
+    long duration = pulseIn(PIN_SONAR_ECHO, HIGH, 30000);
+    if (duration == 0)
+        return MAX_TRACK_WIDTH; // 如果超时，认为距离很远
+
+    float dist = duration * 0.034 / 2.0;
+    return dist;
 }
 
-bool isServoSettled(unsigned long nowMs)
+// 设置电机速度（正数前进，负数后退）
+void setMotorSpeed(int speedL, int speedR)
 {
-    return state.servoAngle == state.servoTargetAngle && (nowMs - state.lastServoCommandMs) >= SERVO_SETTLE_MS;
-}
+    // 处理配置中的反转标志
+    if (MOTOR_LEFT_INVERT)
+        speedL = -speedL;
+    if (MOTOR_RIGHT_INVERT)
+        speedR = -speedR;
 
-float normalizeDistanceCm(float distanceCm)
-{
-    return distanceCm > 0.0f ? distanceCm : 999.0f;
-}
-
-uint8_t computeCruiseSpeed(float frontDistanceCm)
-{
-    float dist = normalizeDistanceCm(frontDistanceCm);
-    if (dist >= DIST_SAFE_THRESHOLD)
+    // 控制左电机
+    if (speedL >= 0)
     {
-        return MOTOR_SPEED_MAX;
-    }
-
-    long speed = map((long)(dist * 10.0f),
-                     (long)(OBSTACLE_SCAN_THRESHOLD * 10.0f),
-                     (long)(DIST_SAFE_THRESHOLD * 10.0f),
-                     MOTOR_SPEED_MIN,
-                     MOTOR_SPEED_MAX);
-    return (uint8_t)constrain(speed, MOTOR_SPEED_MIN, MOTOR_SPEED_MAX);
-}
-
-void setAvoidancePhase(AvoidancePhase phase, unsigned long nowMs, unsigned long durationMs)
-{
-    state.avoidancePhase = phase;
-    state.phaseStartedMs = nowMs;
-    state.phaseDurationMs = durationMs;
-}
-
-void captureHeadingTarget()
-{
-    state.headingTargetDeg = state.yawDeg;
-}
-
-void setMotorStandby(bool enabled)
-{
-#ifdef PIN_MOTOR_STBY
-    digitalWrite(PIN_MOTOR_STBY, enabled ? HIGH : LOW);
-#else
-    (void)enabled;
-#endif
-}
-
-void setMotorOutput(uint8_t pwmPin, uint8_t dirPin, bool forward, uint8_t speed, bool invert)
-{
-    bool dir = invert ? !forward : forward;
-    if (speed == 0)
-    {
-        digitalWrite(dirPin, LOW);
-        analogWrite(pwmPin, 0);
-        return;
-    }
-
-    digitalWrite(dirPin, dir ? HIGH : LOW);
-    analogWrite(pwmPin, speed);
-}
-
-void applyMotion(MotionCommand motion, uint8_t baseSpeed, bool useHeadingCorrection)
-{
-    uint8_t leftSpeed = 0;
-    uint8_t rightSpeed = 0;
-    bool leftForward = true;
-    bool rightForward = true;
-    int correction = 0;
-
-    if (motion != state.motionCommand && (motion == MOTION_FORWARD || motion == MOTION_BACKWARD))
-    {
-        captureHeadingTarget();
-    }
-
-    if (useHeadingCorrection && state.mpuReady && (motion == MOTION_FORWARD || motion == MOTION_BACKWARD))
-    {
-        float yawError = state.yawDeg - state.headingTargetDeg;
-        correction = constrain((int)(yawError * HEADING_CORRECTION_KP), -HEADING_CORRECTION_MAX, HEADING_CORRECTION_MAX);
-    }
-
-    switch (motion)
-    {
-    case MOTION_STOP:
-        leftSpeed = 0;
-        rightSpeed = 0;
-        break;
-    case MOTION_FORWARD:
-        leftForward = true;
-        rightForward = true;
-        leftSpeed = (uint8_t)constrain((int)baseSpeed - correction, 0, 255);
-        rightSpeed = (uint8_t)constrain((int)baseSpeed + correction, 0, 255);
-        break;
-    case MOTION_BACKWARD:
-        leftForward = false;
-        rightForward = false;
-        leftSpeed = (uint8_t)constrain((int)baseSpeed + correction, 0, 255);
-        rightSpeed = (uint8_t)constrain((int)baseSpeed - correction, 0, 255);
-        break;
-    case MOTION_TURN_LEFT:
-        leftForward = false;
-        rightForward = true;
-        leftSpeed = baseSpeed;
-        rightSpeed = baseSpeed;
-        break;
-    case MOTION_TURN_RIGHT:
-        leftForward = true;
-        rightForward = false;
-        leftSpeed = baseSpeed;
-        rightSpeed = baseSpeed;
-        break;
-    }
-
-    state.motionCommand = motion;
-    state.headingCorrection = correction;
-    state.motorLeftForward = leftForward;
-    state.motorRightForward = rightForward;
-    state.motorLeftSpeed = leftSpeed;
-    state.motorRightSpeed = rightSpeed;
-
-    bool enableDriver = motion != MOTION_STOP && (leftSpeed > 0 || rightSpeed > 0);
-    setMotorStandby(enableDriver);
-
-    setMotorOutput(PIN_MOTOR_L_EN, PIN_MOTOR_L_IN1, leftForward, leftSpeed, MOTOR_LEFT_INVERT);
-    setMotorOutput(PIN_MOTOR_R_EN, PIN_MOTOR_R_IN3, rightForward, rightSpeed, MOTOR_RIGHT_INVERT);
-}
-
-// ==========================================
-// 任务具体实现
-// ==========================================
-
-void servoSensorCallback()
-{
-    if (state.servoAngle != state.servoTargetAngle)
-    {
-        state.servoAngle = state.servoTargetAngle;
-        myServo.write(state.servoAngle);
-        state.lastServoCommandMs = millis();
-    }
-
-    if (state.mpuReady)
-    {
-        sensors_event_t a, g, temp;
-        mpu.getEvent(&a, &g, &temp);
-
-        state.accelX = a.acceleration.x;
-        state.accelY = a.acceleration.y;
-        state.accelZ = a.acceleration.z;
-        state.gyroX = g.gyro.x * 57.2958f;
-        state.gyroY = g.gyro.y * 57.2958f;
-        state.temp = temp.temperature;
-
-        float correctedGyroZDeg = (g.gyro.z - state.gyroBiasZ) * 57.2958f;
-        if (fabsf(correctedGyroZDeg) < GYRO_Z_DEADBAND_DPS)
-        {
-            correctedGyroZDeg = 0.0f;
-        }
-        state.gyroZ = correctedGyroZDeg;
-
-        unsigned long nowUs = micros();
-        if (state.lastImuUpdateUs != 0)
-        {
-            float dt = (nowUs - state.lastImuUpdateUs) / 1000000.0f;
-            state.yawDeg += correctedGyroZDeg * dt;
-            while (state.yawDeg > 180.0f)
-                state.yawDeg -= 360.0f;
-            while (state.yawDeg < -180.0f)
-                state.yawDeg += 360.0f;
-        }
-        state.lastImuUpdateUs = nowUs;
-    }
-
-    state.pingTimeUs = sonar.ping();
-    if (state.pingTimeUs > 0)
-    {
-        float speedOfSound = (331.3f + 0.606f * state.temp) / 10000.0f;
-        state.distanceCm = (state.pingTimeUs / 2.0f) * speedOfSound;
+        digitalWrite(PIN_MOTOR_L_IN1, HIGH);
+        digitalWrite(PIN_MOTOR_L_IN2, LOW);
+        analogWrite(PIN_MOTOR_L_EN, constrain(speedL, 0, 255));
     }
     else
     {
-        state.distanceCm = 0.0f;
+        digitalWrite(PIN_MOTOR_L_IN1, LOW);
+        digitalWrite(PIN_MOTOR_L_IN2, HIGH);
+        analogWrite(PIN_MOTOR_L_EN, constrain(-speedL, 0, 255));
     }
 
-    if (abs(state.servoAngle - SERVO_CENTER_ANGLE) <= 5)
+    // 控制右电机
+    if (speedR >= 0)
     {
-        state.frontDistanceCm = state.distanceCm;
-    }
-}
-
-void motorControlCallback()
-{
-    unsigned long nowMs = millis();
-    float frontDistance = normalizeDistanceCm(state.frontDistanceCm);
-
-    switch (state.avoidancePhase)
-    {
-    case AVOID_DRIVE_FORWARD:
-        setServoTarget(SERVO_CENTER_ANGLE);
-        if (frontDistance <= OBSTACLE_SCAN_THRESHOLD)
-        {
-            applyMotion(MOTION_STOP, 0, false);
-            state.scanRightDistanceCm = 0.0f;
-            state.scanCenterDistanceCm = 0.0f;
-            state.scanLeftDistanceCm = 0.0f;
-            setAvoidancePhase(AVOID_SCAN_RIGHT, nowMs);
-            setServoTarget(SERVO_SCAN_RIGHT_ANGLE);
-            return;
-        }
-
-        applyMotion(MOTION_FORWARD, computeCruiseSpeed(frontDistance), true);
-        return;
-
-    case AVOID_SCAN_RIGHT:
-        applyMotion(MOTION_STOP, 0, false);
-        if (isServoSettled(nowMs))
-        {
-            state.scanRightDistanceCm = normalizeDistanceCm(state.distanceCm);
-            setAvoidancePhase(AVOID_SCAN_CENTER, nowMs);
-            setServoTarget(SERVO_CENTER_ANGLE);
-        }
-        return;
-
-    case AVOID_SCAN_CENTER:
-        applyMotion(MOTION_STOP, 0, false);
-        if (isServoSettled(nowMs))
-        {
-            state.scanCenterDistanceCm = normalizeDistanceCm(state.distanceCm);
-            state.frontDistanceCm = state.scanCenterDistanceCm;
-            setAvoidancePhase(AVOID_SCAN_LEFT, nowMs);
-            setServoTarget(SERVO_SCAN_LEFT_ANGLE);
-        }
-        return;
-
-    case AVOID_SCAN_LEFT:
-        applyMotion(MOTION_STOP, 0, false);
-        if (isServoSettled(nowMs))
-        {
-            state.scanLeftDistanceCm = normalizeDistanceCm(state.distanceCm);
-            setAvoidancePhase(AVOID_DECIDE, nowMs);
-            setServoTarget(SERVO_CENTER_ANGLE);
-        }
-        return;
-
-    case AVOID_DECIDE:
-        applyMotion(MOTION_STOP, 0, false);
-        if (!isServoSettled(nowMs))
-        {
-            return;
-        }
-
-        if (state.scanRightDistanceCm > OBSTACLE_SCAN_THRESHOLD)
-        {
-            setAvoidancePhase(AVOID_TURN_RIGHT, nowMs, AVOID_TURN_DURATION_MS);
-            return;
-        }
-        if (state.scanCenterDistanceCm > OBSTACLE_SCAN_THRESHOLD)
-        {
-            captureHeadingTarget();
-            setAvoidancePhase(AVOID_DRIVE_FORWARD, nowMs);
-            return;
-        }
-        if (state.scanLeftDistanceCm > OBSTACLE_SCAN_THRESHOLD)
-        {
-            setAvoidancePhase(AVOID_TURN_LEFT, nowMs, AVOID_TURN_DURATION_MS);
-            return;
-        }
-
-        setAvoidancePhase(AVOID_REVERSE, nowMs, AVOID_REVERSE_DURATION_MS);
-        return;
-
-    case AVOID_REVERSE:
-        applyMotion(MOTION_BACKWARD, MOTOR_TURN_SPEED, true);
-        if ((nowMs - state.phaseStartedMs) >= state.phaseDurationMs)
-        {
-            setAvoidancePhase(AVOID_TURN_RIGHT, nowMs, AVOID_TURN_AFTER_REVERSE_MS);
-        }
-        return;
-
-    case AVOID_TURN_LEFT:
-        applyMotion(MOTION_TURN_LEFT, MOTOR_TURN_SPEED, false);
-        if ((nowMs - state.phaseStartedMs) >= state.phaseDurationMs)
-        {
-            captureHeadingTarget();
-            setAvoidancePhase(AVOID_DRIVE_FORWARD, nowMs);
-        }
-        return;
-
-    case AVOID_TURN_RIGHT:
-        applyMotion(MOTION_TURN_RIGHT, MOTOR_TURN_SPEED, false);
-        if ((nowMs - state.phaseStartedMs) >= state.phaseDurationMs)
-        {
-            captureHeadingTarget();
-            setAvoidancePhase(AVOID_DRIVE_FORWARD, nowMs);
-        }
-        return;
-    }
-}
-
-void ledControlCallback()
-{
-    float dist = normalizeDistanceCm(state.frontDistanceCm);
-    uint32_t color;
-
-    if (dist >= DIST_SAFE_THRESHOLD)
-    {
-        color = strip.Color(0, 255, 0);
-    }
-    else if (dist <= DIST_DANGER_THRESHOLD)
-    {
-        color = strip.Color(255, 0, 0);
+        digitalWrite(PIN_MOTOR_R_IN3, HIGH);
+        digitalWrite(PIN_MOTOR_R_IN4, LOW);
+        analogWrite(PIN_MOTOR_R_EN, constrain(speedR, 0, 255));
     }
     else
     {
-        long hue = map((long)(dist * 10.0f),
-                       (long)(DIST_DANGER_THRESHOLD * 10.0f),
-                       (long)(DIST_SAFE_THRESHOLD * 10.0f),
-                       0,
-                       21845);
-        color = strip.ColorHSV((uint16_t)hue, 255, 255);
+        digitalWrite(PIN_MOTOR_R_IN3, LOW);
+        digitalWrite(PIN_MOTOR_R_IN4, HIGH);
+        analogWrite(PIN_MOTOR_R_EN, constrain(-speedR, 0, 255));
     }
-
-    for (int i = 0; i < strip.numPixels(); i++)
-    {
-        strip.setPixelColor(i, color);
-    }
-    strip.show();
 }
 
-void serialReportCallback()
+// =========================================================
+// 状态处理逻辑
+// =========================================================
+
+// 无阻塞的舵机小角度连续扫描
+void updateServoScan()
 {
-    Log.notice(F("F:%d C:%d Y:%d HC:%d P:%d SR:%d SC:%d SL:%d ML:%d MR:%d FL:%d FR:%d" CR),
-               (int)normalizeDistanceCm(state.frontDistanceCm),
-               (int)normalizeDistanceCm(state.distanceCm),
-               (int)state.yawDeg,
-               state.headingCorrection,
-               (int)state.avoidancePhase,
-               (int)normalizeDistanceCm(state.scanRightDistanceCm),
-               (int)normalizeDistanceCm(state.scanCenterDistanceCm),
-               (int)normalizeDistanceCm(state.scanLeftDistanceCm),
-               (int)state.motorLeftSpeed,
-               (int)state.motorRightSpeed,
-               (int)state.motorLeftForward,
-               (int)state.motorRightForward);
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastServoMoveTime >= SERVO_SCAN_DELAY)
+    {
+        lastServoMoveTime = currentMillis;
+
+        currentServoAngle += servoDirection * SERVO_SCAN_SPEED;
+
+        if (currentServoAngle >= SERVO_CENTER + SERVO_SCAN_AMP)
+        {
+            currentServoAngle = SERVO_CENTER + SERVO_SCAN_AMP;
+            servoDirection = -1; // 触及右边界，反向
+        }
+        else if (currentServoAngle <= SERVO_CENTER - SERVO_SCAN_AMP)
+        {
+            currentServoAngle = SERVO_CENTER - SERVO_SCAN_AMP;
+            servoDirection = 1; // 触及左边界，反向
+        }
+
+        myServo.write(currentServoAngle);
+    }
+}
+
+// 正常行进状态：小角度扫描 + PID 循迹
+void handleNormalState()
+{
+    // 1. 更新舵机位置
+    updateServoScan();
+
+    // 2. 读取当前超声波距离
+    float dist = readSonar();
+
+    // 根据舵机的当前角度，将距离划分为左、中、右
+    // 舵机角度：大于80是左侧，小于80是右侧
+    if (currentServoAngle > SERVO_CENTER + 15)
+    {
+        dist_left = dist;
+    }
+    else if (currentServoAngle < SERVO_CENTER - 15)
+    {
+        dist_right = dist;
+    }
+    else
+    {
+        dist_center = dist;
+        // 如果中间方向距离过近，触发避障状态
+        if (dist_center > 0 && dist_center < OBSTACLE_DIST_THRES)
+        {
+            setMotorSpeed(0, 0); // 紧急停车
+            currentState = STATE_OBSTACLE;
+            return;
+        }
+    }
+
+    // 3. 运行 PID 算法
+    // 对左右距离进行限幅，避免在空旷区域单侧距离过大导致误差飙升
+    float cap_left = min(dist_left, MAX_TRACK_WIDTH);
+    float cap_right = min(dist_right, MAX_TRACK_WIDTH);
+
+    // 误差：左边距离减去右边距离。
+    // 如果 cap_left > cap_right，误差 > 0，说明左侧更宽阔，我们希望车向左偏。
+    // 在这套逻辑下，向左偏需要右轮加速，左轮减速。
+    error = cap_left - cap_right;
+
+    integral += error;
+    integral = constrain(integral, -100, 100); // 积分限幅防饱和
+
+    float derivative = error - last_error;
+
+    // PID 输出的是修正速度
+    float turn_speed = Kp * error + Ki * integral + Kd * derivative;
+    last_error = error;
+
+    // 4. 将修正速度应用到马达
+    // turn_speed > 0 时，speedR增加，speedL减小 -> 左转
+    int speedL = BASE_SPEED - turn_speed;
+    int speedR = BASE_SPEED + turn_speed;
+
+    // 限幅并执行
+    speedL = constrain(speedL, MIN_SPEED, MAX_SPEED);
+    speedR = constrain(speedR, MIN_SPEED, MAX_SPEED);
+
+    setMotorSpeed(speedL, speedR);
+
+    delay(15); // 给超声波模块一点喘息时间
+}
+
+// 避障状态：大角度全景扫描，寻找最远距离并转向
+void handleObstacleState()
+{
+    Serial.println("Obstacle detected! Scanning max angles...");
+
+    int best_angle = SERVO_CENTER;
+    float max_dist = 0;
+
+    // 从右到左进行一次大角度扫描：0度到160度
+    for (int angle = 0; angle <= 160; angle += 20)
+    {
+        myServo.write(angle);
+        delay(100); // 减少等待舵机转动到位的时间 (原为200)
+
+        float d = readSonar();
+        Serial.print("Scan Angle: ");
+        Serial.print(angle);
+        Serial.print(" Dist: ");
+        Serial.println(d);
+
+        // 寻找最开阔的方向
+        if (d > max_dist)
+        {
+            max_dist = d;
+            best_angle = angle;
+        }
+    }
+
+    Serial.print("Best safe angle: ");
+    Serial.println(best_angle);
+
+    // 扫描结束后，舵机归中
+    myServo.write(SERVO_CENTER);
+    currentServoAngle = SERVO_CENTER;
+    delay(150); // 减少归中等待时间 (原为300)
+
+    // 计算最开阔方向与正前方的角度差
+    int angle_diff = best_angle - SERVO_CENTER;
+
+    // 转向逻辑
+    if (max_dist < OBSTACLE_DIST_THRES)
+    {
+        // 如果四周都被堵死（连最远距离都很近），选择后退并随机旋转
+        Serial.println("Trapped! Reversing...");
+        setMotorSpeed(-BASE_SPEED, -BASE_SPEED);
+        delay(600);
+        setMotorSpeed(BASE_SPEED, -BASE_SPEED); // 原地右转
+        delay(800);
+    }
+    else
+    {
+        // 根据角度差估算需要的原地转向时间（时间常数 8 需根据实际车体打滑情况调整）
+        int turn_time = abs(angle_diff) * 8;
+
+        if (angle_diff > 10)
+        {
+            // 需要左转：左轮后退，右轮前进
+            setMotorSpeed(-BASE_SPEED, BASE_SPEED);
+            delay(turn_time);
+        }
+        else if (angle_diff < -10)
+        {
+            // 需要右转：左轮前进，右轮后退
+            setMotorSpeed(BASE_SPEED, -BASE_SPEED);
+            delay(turn_time);
+        }
+    }
+
+    // 转向完毕，刹车
+    setMotorSpeed(0, 0);
+    delay(200);
+
+    // 准备恢复正常状态，重置 PID 的状态变量和历史距离
+    error = 0;
+    last_error = 0;
+    integral = 0;
+    dist_left = MAX_TRACK_WIDTH;
+    dist_right = MAX_TRACK_WIDTH;
+    dist_center = MAX_TRACK_WIDTH;
+
+    Serial.println("Returning to NORMAL state.");
+    currentState = STATE_NORMAL;
 }

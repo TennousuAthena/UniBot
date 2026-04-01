@@ -28,12 +28,12 @@
 // 左电机
 #define PIN_MOTOR_L_EN 6 // PWMB
 #define PIN_MOTOR_L_IN1 8
-#define PIN_MOTOR_L_IN2 8
+#define PIN_MOTOR_L_IN2 9 // 修复：原为 8，现改为 9，以支持反转
 
 // 右电机
 #define PIN_MOTOR_R_EN 5 // PWMA
 #define PIN_MOTOR_R_IN3 7
-#define PIN_MOTOR_R_IN4 7
+#define PIN_MOTOR_R_IN4 2 // 修复：原为 7，现改为 2，以支持反转
 #define PIN_MOTOR_STBY 3
 
 // 电机方向反转开关：0 正常，1 反转（仅影响方向，不影响速度）
